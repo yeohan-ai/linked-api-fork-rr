@@ -463,16 +463,40 @@ class Linkedin(object):
 
         return results
 
-    def search_companies(self, keywords: Optional[List[str]] = None, **kwargs) -> List:
-        """Perform a LinkedIn search for companies.
+    from typing import Optional, List, Dict, Union
+
+    def search_companies(
+        self,
+        keywords: Optional[List[str]] = None,
+        industry: Optional[List[str]] = None,
+        company_size: Optional[List[str]] = None,
+        location: Optional[List[str]] = None,
+        **kwargs
+    ) -> List:
+        """Perform a LinkedIn search for companies with optional filters.
 
         :param keywords: A list of search keywords (str)
         :type keywords: list, optional
+        :param industry: A list of industry filter values (str)
+        :type industry: list, optional
+        :param company_size: A list of company size filter values (str)
+        :type company_size: list, optional
+        :param location: A list of location filter values (Geo URN strings)
+        :type location: list, optional
 
         :return: List of companies
         :rtype: list
         """
+        
         filters = ["(key:resultType,value:List(COMPANIES))"]
+
+        # Add filters if provided
+        if industry:
+            filters.append(f"(key:industryCompanyVertical,value:List({','.join(industry)}))")
+        if company_size:
+            filters.append(f"(key:companySize,value:List({','.join(company_size)}))")
+        if location:
+            filters.append(f"(key:geoUrn,value:List({','.join(location)}))")
 
         params: Dict[str, Union[str, List[str]]] = {
             "filters": "List({})".format(",".join(filters)),
@@ -488,16 +512,23 @@ class Linkedin(object):
         for item in data:
             if "company" not in item.get("trackingUrn"):
                 continue
+            print("NEW RESULT")
+            print(item)
             results.append(
                 {
                     "urn_id": get_id_from_urn(item.get("trackingUrn", None)),
                     "name": (item.get("title") or {}).get("text", None),
                     "headline": (item.get("primarySubtitle") or {}).get("text", None),
                     "subline": (item.get("secondarySubtitle") or {}).get("text", None),
+                    "industry": (item.get("industry") or {}).get("text", None),
+                    "location": (item.get("location") or {}).get("text", None),
+                    "company_size": (item.get("companySize") or {}).get("text", None),
                 }
             )
 
+
         return results
+
 
     def search_jobs(
         self,
