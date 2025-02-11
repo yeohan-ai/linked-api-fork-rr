@@ -470,7 +470,7 @@ class Linkedin(object):
         keywords: Optional[List[str]] = None,
         industry: Optional[List[str]] = None,
         company_size: Optional[List[str]] = None,
-        location: Optional[List[str]] = None,
+        regions: Optional[List[str]] = None,
         **kwargs
     ) -> List:
         """Perform a LinkedIn search for companies with optional filters.
@@ -492,11 +492,11 @@ class Linkedin(object):
 
         # Add filters if provided
         if industry:
-            filters.append(f"(key:industryCompanyVertical,value:List({','.join(industry)}))")
+            filters.append(f"(key:industry,value:List({' | '.join(industry)}))")
         if company_size:
-            filters.append(f"(key:companySize,value:List({','.join(company_size)}))")
-        if location:
-            filters.append(f"(key:geoUrn,value:List({','.join(location)}))")
+            filters.append(f"(key:companySize,value:List({' | '.join(company_size)}))")
+        if regions:
+            filters.append(f"(key:geoUrn,value:List({' | '.join(regions)}))")
 
         params: Dict[str, Union[str, List[str]]] = {
             "filters": "List({})".format(",".join(filters)),
