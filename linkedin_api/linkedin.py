@@ -9,7 +9,7 @@ import uuid
 import re
 from operator import itemgetter
 from time import sleep
-from urllib.parse import urlencode, quote
+from urllib.parse import urlencode, quote, unquote
 from typing import Dict, Union, Optional, List, Literal
 
 from linkedin_api.client import Client
@@ -765,132 +765,231 @@ class Linkedin(object):
 
         return skills
 
-    def get_profile(
-        self, public_id: Optional[str] = None, urn_id: Optional[str] = None
-    ) -> Dict:
-        """Fetch data for a given LinkedIn profile.
+    def get_profile(self, public_id: str) -> Optional[Dict[str, any]]:
+            if not public_id:
+                return None
 
-        :param public_id: LinkedIn public ID for a profile
-        :type public_id: str, optional
-        :param urn_id: LinkedIn URN ID for a profile
-        :type urn_id: str, optional
+            public_id = unquote(public_id)
 
-        :return: Profile data
-        :rtype: dict
-        """
-        # NOTE this still works for now, but will probably eventually have to be converted to
-        # https://www.linkedin.com/voyager/api/identity/profiles/ACoAAAKT9JQBsH7LwKaE9Myay9WcX8OVGuDq9Uw
-        res = self._fetch(f"/identity/profiles/{public_id or urn_id}/profileView")
+            # --- Helper functions reused from experiences parser ---
+            def safe_dict(value):
+                return value if isinstance(value, dict) else {}
 
-        self.is_authenticated(res=res)
+            def safe_list(value):
+                return value if isinstance(value, list) else []
 
-        data = res.json()
-        if data and "status" in data and data["status"] != 200:
-            self.logger.info("request failed: {}".format(data["message"]))
-            return {}
+            # --- Base GraphQL profile query (core identity) ---
+            try:
+                res = self._fetch(
+                    f"/graphql?variables=(vanityName:{public_id})&includeWebMetadata=true"
+                    f"&queryId=voyagerIdentityDashProfiles.a1a483e719b20537a256b6853cdca711",
+                    headers={"accept": "application/vnd.linkedin.normalized+json+2.1"},
+                )
+                self.is_authenticated(res=res)
+                data = res.json()
+            except Exception as e:
+                print("Primary GraphQL request failed:", e)
+                return None
 
-        # massage [profile] data
-        profile = data["profile"]
-        if "miniProfile" in profile:
-            if "picture" in profile["miniProfile"]:
-                profile["displayPictureUrl"] = profile["miniProfile"]["picture"][
-                    "com.linkedin.common.VectorImage"
-                ]["rootUrl"]
+            included = data.get("included", []) or []
+            profile_obj = next(
+                (entry for entry in included if entry.get("publicIdentifier") == public_id),
+                None,
+            )
+            if not profile_obj:
+                print("Profile not found in GraphQL response.")
+                return None
 
-                images_data = profile["miniProfile"]["picture"][
-                    "com.linkedin.common.VectorImage"
-                ]["artifacts"]
-                for img in images_data:
-                    w, h, url_segment = itemgetter(
-                        "width", "height", "fileIdentifyingUrlPathSegment"
-                    )(img)
-                    profile[f"img_{w}_{h}"] = url_segment
+            # --- Base fields ---
+            result: Dict[str, any] = {
+                "firstName": profile_obj.get("firstName"),
+                "lastName": profile_obj.get("lastName"),
+                "profile_urn": profile_obj.get("entityUrn"),
+                "member_urn": profile_obj.get("objectUrn"),
+                "urn_id": get_id_from_urn(profile_obj.get("entityUrn")),
+                "profile_id": get_id_from_urn(profile_obj.get("entityUrn")),
+            }
 
-            profile["profile_id"] = get_id_from_urn(profile["miniProfile"]["entityUrn"])
-            profile["profile_urn"] = profile["miniProfile"]["entityUrn"]
-            profile["member_urn"] = profile["miniProfile"]["objectUrn"]
-            profile["public_id"] = profile["miniProfile"]["publicIdentifier"]
+            # --- Display picture ---
+            display_pic = profile_obj.get("picture")
+            if display_pic and "com.linkedin.common.VectorImage" in display_pic:
+                vector_img = display_pic["com.linkedin.common.VectorImage"]
+                result["displayPictureUrl"] = vector_img.get("rootUrl")
+                for artifact in vector_img.get("artifacts", []):
+                    w, h, seg = artifact.get("width"), artifact.get("height"), artifact.get("fileIdentifyingUrlPathSegment")
+                    if w and h and seg:
+                        result[f"img_{w}_{h}"] = seg
 
-            del profile["miniProfile"]
+            # --- Basic info ---
+            result["location"] = profile_obj.get("locationName") or profile_obj.get("geoLocationName")
+            result["headline"] = profile_obj.get("headline")
+            result["summary"] = profile_obj.get("summary") or profile_obj.get("summaryText")
 
-        del profile["defaultLocale"]
-        del profile["supportedLocales"]
-        del profile["versionTag"]
-        del profile["showEducationOnProfileTopCard"]
-
-        # massage [experience] data
-        experience = data["positionView"]["elements"]
-        for item in experience:
-            if "company" in item and "miniCompany" in item["company"]:
-                if "logo" in item["company"]["miniCompany"]:
-                    logo = item["company"]["miniCompany"]["logo"].get(
-                        "com.linkedin.common.VectorImage"
+            # --- Secondary GraphQL for extended details ---
+            try:
+                res_more = self._fetch(
+                    f"/graphql?variables=(vanityName:{public_id})"
+                    f"&queryId=voyagerIdentityDashProfiles.34ead06db82a2cc9a778fac97f69ad6a",
+                    headers={"accept": "application/vnd.linkedin.normalized+json+2.1"},
+                )
+                if res_more.ok:
+                    more_data = res_more.json()
+                    included_more = more_data.get("included", [])
+                    extra_profile = next(
+                        (x for x in included_more if x.get("publicIdentifier") == public_id),
+                        None,
                     )
-                    if logo:
-                        item["companyLogoUrl"] = logo["rootUrl"]
-                del item["company"]["miniCompany"]
+                    if extra_profile:
+                        result["createdAt"] = extra_profile.get("createdAt")
+                        result["lastModifiedAt"] = extra_profile.get("lastModifiedAt")
+                        result["phoneticFirstName"] = extra_profile.get("phoneticFirstName")
+                        result["phoneticLastName"] = extra_profile.get("phoneticLastName")
+            except Exception as e:
+                print("Secondary GraphQL fetch failed:", e)
 
-        profile["experience"] = experience
+            # --- Experience section via separate GraphQL query ---
+            try:
+                urn_id = result["urn_id"]
+                profile_urn = f"urn:li:fsd_profile:{urn_id}"
+                variables = ",".join(
+                    [f"profileUrn:{quote(profile_urn)}", "sectionType:experience"]
+                )
+                query_id = "voyagerIdentityDashProfileComponents.7af5d6f176f11583b382e37e5639e69e"
 
-        # massage [education] data
-        education = data["educationView"]["elements"]
-        for item in education:
-            if "school" in item:
-                if "logo" in item["school"]:
-                    item["school"]["logoUrl"] = item["school"]["logo"][
-                        "com.linkedin.common.VectorImage"
-                    ]["rootUrl"]
-                    del item["school"]["logo"]
+                res_exp = self._fetch(
+                    f"/graphql?variables=({variables})&queryId={query_id}&includeWebMetadata=true",
+                    headers={"accept": "application/vnd.linkedin.normalized+json+2.1"},
+                )
+                exp_data = res_exp.json()
+                included_exp = safe_list(exp_data.get("included"))
+                first_included = safe_dict(included_exp[0]) if included_exp else {}
+                elements = safe_list(safe_dict(first_included.get("components")).get("elements"))
 
-        profile["education"] = education
+                def parse_item(item, is_group_item=False):
+                    component = safe_dict(safe_dict(item).get("components")).get("entityComponent", {})
 
-        # massage [languages] data
-        languages = data["languageView"]["elements"]
-        for item in languages:
-            del item["entityUrn"]
-        profile["languages"] = languages
+                    title_data = safe_dict(component.get("titleV2")).get("text", {})
+                    title = title_data.get("text")
 
-        # massage [publications] data
-        publications = data["publicationView"]["elements"]
-        for item in publications:
-            del item["entityUrn"]
-            for author in item.get("authors", []):
-                del author["entityUrn"]
-        profile["publications"] = publications
+                    subtitle_data = safe_dict(component.get("subtitle"))
+                    subtitle_text = subtitle_data.get("text", "")
+                    company = subtitle_text.split(" · ")[0] if subtitle_text else None
+                    employment_type = subtitle_text.split(" · ")[1] if " · " in subtitle_text else None
 
-        # massage [certifications] data
-        certifications = data["certificationView"]["elements"]
-        for item in certifications:
-            del item["entityUrn"]
-        profile["certifications"] = certifications
+                    metadata = safe_dict(component.get("metadata"))
+                    location = metadata.get("text")
 
-        # massage [volunteer] data
-        volunteer = data["volunteerExperienceView"]["elements"]
-        for item in volunteer:
-            del item["entityUrn"]
-        profile["volunteer"] = volunteer
+                    caption = safe_dict(component.get("caption"))
+                    duration_text = caption.get("text", "")
+                    duration_parts = duration_text.split(" · ") if duration_text else []
+                    date_parts = duration_parts[0].split(" - ") if duration_parts else []
 
-        # massage [honors] data
-        honors = data["honorView"]["elements"]
-        for item in honors:
-            del item["entityUrn"]
-        profile["honors"] = honors
+                    duration = duration_parts[1] if len(duration_parts) > 1 else None
+                    start_date = date_parts[0] if date_parts else None
+                    end_date = date_parts[1] if len(date_parts) > 1 else None
 
-        # massage [projects] data
-        projects = data["projectView"]["elements"]
-        for item in projects:
-            del item["entityUrn"]
-        profile["projects"] = projects
-        # massage [skills] data
-        skills = data["skillView"]["elements"]
-        for item in skills:
-            del item["entityUrn"]
-        profile["skills"] = skills
+                    description = None
+                    sub_components = safe_dict(component.get("subComponents"))
+                    for sub in safe_list(sub_components.get("components")):
+                        sub_comp = safe_dict(sub).get("components")
+                        if not sub_comp:
+                            continue
+                        fixed_list_component = safe_dict(sub_comp).get("fixedListComponent")
+                        if not fixed_list_component:
+                            continue
+                        for inner in safe_list(fixed_list_component.get("components")):
+                            text_comp = safe_dict(safe_dict(inner).get("components")).get("textComponent")
+                            if text_comp:
+                                description = safe_dict(text_comp).get("text", {}).get("text")
+                                break
+                        if description:
+                            break
 
-        profile["urn_id"] = profile["entityUrn"].replace("urn:li:fs_profile:", "")
+                    return {
+                        "title": title,
+                        "companyName": company if not is_group_item else None,
+                        "employmentType": None if is_group_item else employment_type,
+                        "locationName": location,
+                        "duration": duration,
+                        "startDate": start_date,
+                        "endDate": end_date,
+                        "description": description,
+                    }
 
-        return profile
+                def get_grouped_item_id(item):
+                    entity_component = safe_dict(safe_dict(item).get("components")).get("entityComponent", {})
+                    sub_components = safe_dict(entity_component.get("subComponents"))
+                    for sub in safe_list(sub_components.get("components")):
+                        comp = safe_dict(sub).get("components")
+                        if not comp:
+                            continue
+                        paged_list_component_id = safe_dict(comp).get("*pagedListComponent", "")
+                        if paged_list_component_id and "fsd_profilePositionGroup" in paged_list_component_id:
+                            pattern = r"urn:li:fsd_profilePositionGroup:\([A-z0-9]+,[A-z0-9]+\)"
+                            match = re.search(pattern, paged_list_component_id)
+                            if match:
+                                return match.group(0)
+                    return None
 
+                experiences = []
+                for item in elements:
+                    grouped_item_id = get_grouped_item_id(item)
+                    if grouped_item_id:
+                        component = safe_dict(safe_dict(item).get("components")).get("entityComponent", {})
+                        company = safe_dict(component.get("titleV2")).get("text", {}).get("text")
+                        location = safe_dict(component.get("caption")).get("text")
+                        group = [
+                            i for i in safe_list(exp_data.get("included"))
+                            if grouped_item_id in i.get("entityUrn", "")
+                        ]
+                        if not group:
+                            continue
+                        group_elements = safe_list(safe_dict(group[0].get("components")).get("elements"))
+                        for group_item in group_elements:
+                            parsed_data = parse_item(group_item, is_group_item=True)
+                            parsed_data["companyName"] = company
+                            parsed_data["locationName"] = location
+                            experiences.append(parsed_data)
+                        continue
+
+                    parsed_data = parse_item(item)
+                    experiences.append(parsed_data)
+
+                result["experience"] = experiences
+
+            except Exception as e:
+                print("Failed to fetch experience section:", e)
+                result["experience"] = []
+
+            # --- Education / Skills / Other sections from main GraphQL ---
+            sections = {
+                "education": "educationView",
+                "languages": "languageView",
+                "publications": "publicationView",
+                "certifications": "certificationView",
+                "volunteer": "volunteerExperienceView",
+                "honors": "honorView",
+                "projects": "projectView",
+                "skills": "skillView",
+            }
+
+            for key, section in sections.items():
+                section_data = next((x for x in included if x.get("entityUrn", "").endswith(section)), None)
+                if not section_data:
+                    continue
+                elements = section_data.get("elements", [])
+                for item in elements:
+                    item.pop("entityUrn", None)
+                    if "school" in item and "logo" in item["school"]:
+                        logo = item["school"]["logo"].get("com.linkedin.common.VectorImage")
+                        if logo:
+                            item["school"]["logoUrl"] = logo.get("rootUrl")
+                        item["school"].pop("logo", None)
+                result[key] = elements
+
+            return result
+
+    
     def get_profile_connections(self, urn_id: str, **kwargs) -> List:
         """Fetch connections for a given LinkedIn profile.
 
