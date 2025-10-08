@@ -1297,32 +1297,83 @@ class Linkedin(object):
 
         return school
 
-    def get_company(self, public_id):
-        """Fetch data about a given LinkedIn company.
+    def get_company(self, public_id: str) -> dict:
+        def safe_dict(value):
+            return value if isinstance(value, dict) else {}
 
-        :param public_id: LinkedIn public ID for a company
-        :type public_id: str
+        def safe_list(value):
+            return value if isinstance(value, list) else []
 
-        :return: Company data
-        :rtype: dict
-        """
-        params = {
-            "decorationId": "com.linkedin.voyager.deco.organization.web.WebFullCompanyMain-12",
-            "q": "universalName",
-            "universalName": public_id,
-        }
+        if not public_id:
+            print("❌ get_company() called without a public_id.")
+            return None
 
-        res = self._fetch(f"/organization/companies", params=params)
+        public_id = unquote(public_id)
 
-        data = res.json()
+        try:
+            # 1️⃣ Fetch company data using LinkedIn’s Voyager GraphQL
+            res = self._fetch(
+                f"/graphql?includeWebMetadata=true&variables=(universalName:{public_id})&queryId=voyagerOrganizationDashCompanies.1164a39ce57e74d426483681eeb51d02",
+                headers={"accept": "application/vnd.linkedin.normalized+json+2.1"},
+            )
+            
+            if not res.ok:
+                print("GraphQL request failed:", res.status_code, res.text)
+                return None
 
-        if data and "status" in data and data["status"] != 200:
-            self.logger.info("request failed: {}".format(data["message"]))
-            return {}
+            # 2️⃣ Parse JSON safely
+            try:
+                data = res.json()
+                print(f"data: {data}")
+            except Exception as e:
+                print("Failed to parse GraphQL JSON:", e)
+                return None
 
-        company = data["elements"][0]
+            included = safe_list(data.get("included"))
+            if not included:
+                print("No 'included' field found in GraphQL response.")
+                return None
 
-        return company
+            # 3️⃣ Locate the target company object
+            company_obj = next(
+                (item for item in included if item.get("universalName") == public_id),
+                None
+            )
+
+            if not company_obj:
+                print(f"Company with universalName '{public_id}' not found in GraphQL response.")
+                return None
+
+            # 4️⃣ Extract useful fields
+            company = {
+                "name": company_obj.get("name"),
+                "universalName": company_obj.get("universalName"),
+                "description": company_obj.get("description"),
+                "websiteUrl": company_obj.get("websiteUrl"),
+                "staffCountRange": safe_dict(company_obj.get("staffCountRange")).get("start"),
+                "employeeCount": company_obj.get("employeeCount"),
+                "industryName": company_obj.get("industryName"),
+                "companyType": safe_dict(company_obj.get("companyType")).get("localizedName"),
+                "foundedYear": safe_dict(company_obj.get("foundedOn")).get("year"),
+                "specialities": company_obj.get("specialities", []),
+            }
+
+            # Extract nested HQ details if present
+            headquarter = safe_dict(company_obj.get("headquarter"))
+            address = safe_dict(headquarter.get("address"))
+            company["headquarter"] = {
+                "city": address.get("city"),
+                "line1": address.get("line1"),
+                "country": address.get("countryCode"),
+            }
+
+            print(f"✅ Successfully fetched company profile: {company.get('name')}")
+            print(f"COMPANY DETAILS: {company}")
+            return company
+
+        except Exception as e:
+            print("Exception while fetching company data:", e)
+            return None
 
     def follow_company(self, following_state_urn, following=True):
         """Follow a company from its ID.
